@@ -175,10 +175,14 @@ func defaultInterfaceChanged(oldInterface *control.Interface, newInterface *cont
 }
 
 func interfaceNetworks(addresses []netip.Prefix) []netip.Prefix {
-	return common.Uniq(common.Map(addresses, func(it netip.Prefix) netip.Prefix {
-		if !it.Addr().Is6() {
-			return it
+	networks := make([]netip.Prefix, 0, len(addresses))
+	for _, address := range addresses {
+		if address.Addr().Is6() {
+			address = netip.PrefixFrom(address.Addr(), min(address.Bits(), 64)).Masked()
 		}
-		return netip.PrefixFrom(it.Addr(), min(it.Bits(), 64)).Masked()
-	}))
+		if !slices.Contains(networks, address) {
+			networks = append(networks, address)
+		}
+	}
+	return networks
 }
