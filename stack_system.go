@@ -125,12 +125,6 @@ func NewSystem(options StackOptions) (Stack, error) {
 }
 
 func (s *System) ResetNetwork() {
-	if s.tcpNat4 != nil {
-		s.tcpNat4.Purge()
-	}
-	if s.tcpNat6 != nil {
-		s.tcpNat6.Purge()
-	}
 	if s.udpNat != nil {
 		s.udpNat.Purge()
 	}
@@ -258,14 +252,21 @@ func (s *System) tunLoop() {
 		return
 	}
 	packetBuffer := make([]byte, s.mtu+PacketOffset)
+	var readRetry ReadRetry
 	for {
 		n, err := s.tun.Read(packetBuffer)
 		if err != nil {
-			if E.IsClosed(err) {
-				return
+			if IsRecoverableReadError(err) {
+				s.logger.Debug(E.Cause(err, "read packet"))
+				readRetry.Wait(err)
+				continue
 			}
-			s.logger.Error(E.Cause(err, "read packet"))
+			if !E.IsClosed(err) {
+				s.logger.Error(E.Cause(err, "read packet"))
+			}
+			return
 		}
+		readRetry.Reset()
 		if n < header.IPv4MinimumSize {
 			continue
 		}
@@ -309,13 +310,20 @@ func (s *System) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 	for i := range packetBuffers {
 		packetBuffers[i] = make([]byte, s.mtu+s.frontHeadroom)
 	}
+	var readRetry ReadRetry
 	for {
 		n, err := linuxTUN.BatchRead(packetBuffers, s.frontHeadroom, packetSizes)
 		if err != nil {
-			if E.IsClosed(err) {
+			if !IsRecoverableReadError(err) {
+				if !E.IsClosed(err) {
+					s.logger.Error(E.Cause(err, "batch read packet"))
+				}
 				return
 			}
-			s.logger.Error(E.Cause(err, "batch read packet"))
+			s.logger.Debug(E.Cause(err, "batch read packet"))
+			readRetry.Wait(err)
+		} else {
+			readRetry.Reset()
 		}
 		if n == 0 {
 			continue
@@ -345,13 +353,20 @@ func (s *System) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 func (s *System) batchLoopDarwin(darwinTUN DarwinTUN) {
 	var writeBuffers []*buf.Buffer
 	var releaseBuffers []*buf.Buffer
+	var readRetry ReadRetry
 	for {
 		buffers, err := darwinTUN.BatchRead()
 		if err != nil {
-			if E.IsClosed(err) || errors.Is(err, syscall.EBADF) {
+			if !IsRecoverableReadError(err) {
+				if !E.IsClosed(err) && !errors.Is(err, syscall.EBADF) {
+					s.logger.Error(E.Cause(err, "batch read packet"))
+				}
 				return
 			}
-			s.logger.Error(E.Cause(err, "batch read packet"))
+			s.logger.Debug(E.Cause(err, "batch read packet"))
+			readRetry.Wait(err)
+		} else {
+			readRetry.Reset()
 		}
 		if len(buffers) == 0 {
 			continue
