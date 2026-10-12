@@ -1,6 +1,7 @@
 package tun
 
 import (
+	"runtime"
 	"slices"
 	"sync"
 
@@ -79,8 +80,10 @@ func (m *networkUpdateMonitor) Close() error {
 }
 
 type registryWatcher struct {
+	paths  []string
 	keys   []registry.Key
 	events []windows.Handle
+	filter uint32
 	done   chan struct{}
 }
 
@@ -90,7 +93,9 @@ func newRegistryWatcher(paths []string, callback func(), logger logger.Logger) (
 		return nil, E.Cause(err, "create event")
 	}
 	watcher := &registryWatcher{
+		paths:  paths,
 		events: []windows.Handle{closeEvent},
+		filter: registryNotifyFilter,
 		done:   make(chan struct{}),
 	}
 	for _, path := range paths {
@@ -108,18 +113,44 @@ func newRegistryWatcher(paths []string, callback func(), logger logger.Logger) (
 			return nil, E.Cause(err, "create event")
 		}
 		watcher.events = append(watcher.events, event)
-		err = windows.RegNotifyChangeKeyValue(windows.Handle(key), true, registryNotifyFilter, event, true)
-		if err != nil {
-			watcher.release()
-			return nil, E.Cause(err, "watch registry key ", path)
-		}
 	}
-	go watcher.loop(callback, logger)
+	// lx: SPEC 130 — notifications are armed on the loop's locked thread (see notify)
+	armed := make(chan error, 1)
+	go watcher.loop(callback, logger, armed)
+	err = <-armed
+	if err != nil {
+		<-watcher.done
+		watcher.release()
+		return nil, err
+	}
 	return watcher, nil
 }
 
-func (w *registryWatcher) loop(callback func(), logger logger.Logger) {
+// lx: SPEC 130 — Windows 7 rejects REG_NOTIFY_THREAD_AGNOSTIC (Windows 8+) with
+// ERROR_INVALID_PARAMETER. Without the flag a notification is cancelled when the
+// registering thread exits, so all registrations happen on the loop goroutine,
+// which stays locked to its OS thread for the watcher's lifetime.
+func (w *registryWatcher) notify(index int) error {
+	err := windows.RegNotifyChangeKeyValue(windows.Handle(w.keys[index]), true, w.filter, w.events[index+1], true)
+	if err == windows.ERROR_INVALID_PARAMETER && w.filter&windows.REG_NOTIFY_THREAD_AGNOSTIC != 0 {
+		w.filter &^= windows.REG_NOTIFY_THREAD_AGNOSTIC
+		err = windows.RegNotifyChangeKeyValue(windows.Handle(w.keys[index]), true, w.filter, w.events[index+1], true)
+	}
+	return err
+}
+
+func (w *registryWatcher) loop(callback func(), logger logger.Logger, armed chan<- error) {
 	defer close(w.done)
+	// lx: SPEC 130 — never unlocked: the thread exits together with the goroutine
+	runtime.LockOSThread()
+	for index, path := range w.paths {
+		err := w.notify(index)
+		if err != nil {
+			armed <- E.Cause(err, "watch registry key ", path)
+			return
+		}
+	}
+	armed <- nil
 	for {
 		event, err := windows.WaitForMultipleObjects(w.events, false, windows.INFINITE)
 		if err != nil {
@@ -130,7 +161,7 @@ func (w *registryWatcher) loop(callback func(), logger logger.Logger) {
 		if index == 0 {
 			return
 		}
-		err = windows.RegNotifyChangeKeyValue(windows.Handle(w.keys[index-1]), true, registryNotifyFilter, w.events[index], true)
+		err = w.notify(index - 1)
 		if err != nil {
 			logger.Error("watch registry key: ", err)
 			return
