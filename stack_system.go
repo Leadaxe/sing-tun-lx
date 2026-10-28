@@ -441,7 +441,7 @@ func (s *System) acceptLoop(listener net.Listener, tcpNat *TCPNat, isIPv6 bool) 
 			continue
 		}
 		connPort := M.SocksaddrFromNet(conn.RemoteAddr()).Port
-		session := tcpNat.LookupBack(connPort)
+		session := tcpNat.LookupBack(connPort, 0)
 		if session == nil {
 			s.logger.Trace(E.New("unknown session with port ", connPort))
 			continue
@@ -601,7 +601,7 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 	if !destination.Addr().IsGlobalUnicast() {
 		return false, nil
 	} else if source.Addr() == s.inet4Address && source.Port() == uint16(s.tcpPort.Load()) {
-		session := s.tcpNat4.LookupBack(destination.Port())
+		session := s.tcpNat4.LookupBack(destination.Port(), tcpHdr.Flags())
 		if session == nil {
 			return false, E.New("ipv4: tcp: session not found: ", destination.Port())
 		}
@@ -620,7 +620,7 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
 			}
 		}
 		if !loopback {
-			natPort := s.tcpNat4.Lookup(source, destination)
+			natPort := s.tcpNat4.Lookup(source, destination, tcpHdr.Flags())
 			if natPort == 0 {
 				return false, E.New("ipv4: tcp: NAT port space exhausted")
 			}
@@ -644,7 +644,7 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 	if !destination.Addr().IsGlobalUnicast() {
 		return false, nil
 	} else if source.Addr() == s.inet6Address && source.Port() == uint16(s.tcpPort6.Load()) {
-		session := s.tcpNat6.LookupBack(destination.Port())
+		session := s.tcpNat6.LookupBack(destination.Port(), tcpHdr.Flags())
 		if session == nil {
 			return false, E.New("ipv6: tcp: session not found: ", destination.Port())
 		}
@@ -663,7 +663,7 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
 			}
 		}
 		if !loopback {
-			natPort := s.tcpNat6.Lookup(source, destination)
+			natPort := s.tcpNat6.Lookup(source, destination, tcpHdr.Flags())
 			if natPort == 0 {
 				return false, E.New("ipv6: tcp: NAT port space exhausted")
 			}

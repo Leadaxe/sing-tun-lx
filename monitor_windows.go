@@ -14,7 +14,7 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
-const registryNotifyFilter = windows.REG_NOTIFY_CHANGE_NAME | windows.REG_NOTIFY_CHANGE_LAST_SET | windows.REG_NOTIFY_THREAD_AGNOSTIC
+const registryNotifyFilter = windows.REG_NOTIFY_CHANGE_NAME | windows.REG_NOTIFY_CHANGE_LAST_SET
 
 var dnsRegistryPaths = []string{
 	`SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces`,
@@ -83,7 +83,6 @@ type registryWatcher struct {
 	paths  []string
 	keys   []registry.Key
 	events []windows.Handle
-	filter uint32
 	done   chan struct{}
 }
 
@@ -95,7 +94,6 @@ func newRegistryWatcher(paths []string, callback func(), logger logger.Logger) (
 	watcher := &registryWatcher{
 		paths:  paths,
 		events: []windows.Handle{closeEvent},
-		filter: registryNotifyFilter,
 		done:   make(chan struct{}),
 	}
 	for _, path := range paths {
@@ -126,17 +124,12 @@ func newRegistryWatcher(paths []string, callback func(), logger logger.Logger) (
 	return watcher, nil
 }
 
-// lx: SPEC 130 — Windows 7 rejects REG_NOTIFY_THREAD_AGNOSTIC (Windows 8+) with
-// ERROR_INVALID_PARAMETER. Without the flag a notification is cancelled when the
+// lx: SPEC 130 — registryNotifyFilter has no REG_NOTIFY_THREAD_AGNOSTIC (Windows
+// 7 rejects it), and without the flag a notification is cancelled when the
 // registering thread exits, so all registrations happen on the loop goroutine,
 // which stays locked to its OS thread for the watcher's lifetime.
 func (w *registryWatcher) notify(index int) error {
-	err := windows.RegNotifyChangeKeyValue(windows.Handle(w.keys[index]), true, w.filter, w.events[index+1], true)
-	if err == windows.ERROR_INVALID_PARAMETER && w.filter&windows.REG_NOTIFY_THREAD_AGNOSTIC != 0 {
-		w.filter &^= windows.REG_NOTIFY_THREAD_AGNOSTIC
-		err = windows.RegNotifyChangeKeyValue(windows.Handle(w.keys[index]), true, w.filter, w.events[index+1], true)
-	}
-	return err
+	return windows.RegNotifyChangeKeyValue(windows.Handle(w.keys[index]), true, registryNotifyFilter, w.events[index+1], true)
 }
 
 func (w *registryWatcher) loop(callback func(), logger logger.Logger, armed chan<- error) {
