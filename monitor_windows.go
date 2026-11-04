@@ -210,7 +210,7 @@ func (m *defaultInterfaceMonitor) checkUpdate() error {
 			continue
 		}
 
-		if !iface.Connected {
+		if !iface.Connected || iface.DisableDefaultRoutes {
 			continue
 		}
 
