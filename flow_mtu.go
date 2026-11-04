@@ -1,80 +1,79 @@
 package tun
 
 import (
+	"encoding/binary"
+
 	"github.com/sagernet/sing-tun/gtcpip/header"
-	E "github.com/sagernet/sing/common/exceptions"
 )
 
 // segmentRetainCount bounds how many segment buffers survive a Flush; the pool
 // grows to the burst high-water mark within a batch and is trimmed afterwards.
 const segmentRetainCount = 128
 
-// Linux delivers TSO aggregates to the TUN even with IFF_VNET_HDR off
-// (observed on 6.x: the pre-segmentation skb is handed to the fd as-is).
-func (d *ForwardDispatcher) resegmentTCP(flow *forwardFlow, packet *forwardPacket, raw []byte) {
-	if len(packet.transport) < header.TCPMinimumSize {
-		return
+func tcpSegmentSize(packet *forwardPacket, raw []byte, effectiveMTU uint32) (headerLength int, segmentSize int, ok bool) {
+	if packet.fragment || len(packet.transport) < header.TCPMinimumSize {
+		return 0, 0, false
 	}
-	headerLength := len(raw) - len(packet.transport)
-	if packet.ipVersion == 6 && headerLength != header.IPv6MinimumSize {
-		reply, ok := buildPacketTooBig(packet.network.(header.IPv6), flow.effectiveMTU, d.writeback.ReturnHeadroom())
-		if ok {
-			d.writebackBatch = append(d.writebackBatch, reply)
-		}
-		return
+	networkLength := len(raw) - len(packet.transport)
+	if packet.ipVersion == 6 && networkLength != header.IPv6MinimumSize {
+		return 0, 0, false
 	}
 	tcpHeaderLength := int(header.TCP(packet.transport).DataOffset())
 	if tcpHeaderLength < header.TCPMinimumSize || tcpHeaderLength > len(packet.transport) {
-		return
+		return 0, 0, false
 	}
-	totalHeaderLength := headerLength + tcpHeaderLength
-	segmentSize := int(flow.effectiveMTU) - totalHeaderLength
-	if segmentSize <= 0 {
-		return
-	}
+	headerLength = networkLength + tcpHeaderLength
+	segmentSize = int(effectiveMTU) - headerLength
+	return headerLength, segmentSize, segmentSize > 0
+}
+
+// Linux delivers TSO aggregates to the TUN even with IFF_VNET_HDR off
+// (observed on 6.x: the pre-segmentation skb is handed to the fd as-is).
+func segmentTCP(output relayOutput, packet *forwardPacket, raw []byte, headerLength int, segmentSize int) error {
+	headroom := output.relayHeadroom()
 	gsoType := GSOTCPv4
 	if packet.ipVersion == 6 {
 		gsoType = GSOTCPv6
 	}
-	neededSegments := max((len(raw)-totalHeaderLength+segmentSize-1)/segmentSize, 1)
-	bufs, sizes := d.reserveSegments(neededSegments, int(flow.effectiveMTU))
+	neededSegments := max((len(raw)-headerLength+segmentSize-1)/segmentSize, 1)
+	buffers, sizes := output.relayReserve(neededSegments, headroom+headerLength+segmentSize)
 	n, err := GSOSplit(raw, GSOOptions{
 		GSOType:    gsoType,
-		HdrLen:     uint16(totalHeaderLength),
-		CsumStart:  uint16(headerLength),
+		HdrLen:     uint16(headerLength),
+		CsumStart:  uint16(len(raw) - len(packet.transport)),
 		CsumOffset: header.TCPChecksumOffset,
 		GSOSize:    uint16(segmentSize),
-	}, bufs, sizes, 0)
+	}, buffers, sizes, headroom)
 	if err != nil {
-		d.logger.Trace(E.Cause(err, "resegment packet"))
-		return
+		return err
 	}
 	for i := range n {
-		d.stagePort(flow.nat, bufs[i][:sizes[i]])
+		output.relaySegment(buffers[i][:headroom+sizes[i]])
 	}
+	return nil
 }
 
-func (d *ForwardDispatcher) reserveSegments(count, size int) ([][]byte, []int) {
-	start := d.segmentUsed
+func (s *ForwardStage) reserveSegments(count, size int) ([][]byte, []int) {
+	start := s.segmentUsed
 	end := start + count
-	for len(d.segmentBuffers) < end {
-		d.segmentBuffers = append(d.segmentBuffers, make([]byte, size))
-		d.segmentSizes = append(d.segmentSizes, 0)
+	for len(s.segmentBuffers) < end {
+		s.segmentBuffers = append(s.segmentBuffers, make([]byte, size))
+		s.segmentSizes = append(s.segmentSizes, 0)
 	}
 	for i := start; i < end; i++ {
-		if cap(d.segmentBuffers[i]) < size {
-			d.segmentBuffers[i] = make([]byte, size)
+		if cap(s.segmentBuffers[i]) < size {
+			s.segmentBuffers[i] = make([]byte, size)
 		} else {
-			d.segmentBuffers[i] = d.segmentBuffers[i][:size]
+			s.segmentBuffers[i] = s.segmentBuffers[i][:size]
 		}
 	}
-	d.segmentUsed = end
-	return d.segmentBuffers[start:end], d.segmentSizes[start:end]
+	s.segmentUsed = end
+	return s.segmentBuffers[start:end], s.segmentSizes[start:end]
 }
 
 const synthesizedTTL = 64
 
-func fragmentIPv4Packet(packet header.IPv4, effectiveMTU uint32) ([][]byte, bool) {
+func fragmentIPv4Packet(packet header.IPv4, effectiveMTU uint32, headroom int) ([][]byte, bool) {
 	headerLength := int(packet.HeaderLength())
 	if headerLength < header.IPv4MinimumSize || headerLength >= len(packet) {
 		return nil, false
@@ -90,7 +89,8 @@ func fragmentIPv4Packet(packet header.IPv4, effectiveMTU uint32) ([][]byte, bool
 	fragments := make([][]byte, 0, (len(payload)+maxFragmentPayload-1)/maxFragmentPayload)
 	for start := 0; start < len(payload); start += maxFragmentPayload {
 		end := min(start+maxFragmentPayload, len(payload))
-		fragment := header.IPv4(make([]byte, headerLength+end-start))
+		buffer := make([]byte, headroom+headerLength+end-start)
+		fragment := header.IPv4(buffer[headroom:])
 		copy(fragment, packet[:headerLength])
 		copy(fragment[headerLength:], payload[start:end])
 		flags := baseFlags
@@ -101,67 +101,43 @@ func fragmentIPv4Packet(packet header.IPv4, effectiveMTU uint32) ([][]byte, bool
 		fragment.SetTotalLength(uint16(len(fragment)))
 		fragment.SetChecksum(0)
 		fragment.SetChecksum(^fragment.CalculateChecksum())
-		fragments = append(fragments, fragment)
+		fragments = append(fragments, buffer)
 	}
 	return fragments, true
 }
 
-func buildFragmentationNeeded(packet header.IPv4, effectiveMTU uint32, headroom int) ([]byte, bool) {
-	advertised := max(effectiveMTU, header.IPv4MinimumMTU)
-	originalLength := min(int(packet.TotalLength()), len(packet))
-	minPayloadLength := int(packet.HeaderLength()) + header.ICMPv4MinimumErrorPayloadSize
-	if originalLength < minPayloadLength {
+func fragmentIPv6Packet(packet header.IPv6, effectiveMTU uint32, ident uint32, headroom int) ([][]byte, bool) {
+	if len(packet) < header.IPv6MinimumSize {
 		return nil, false
 	}
-	maxPayloadLength := header.IPv4MinimumProcessableDatagramSize - header.IPv4MinimumSize - header.ICMPv4MinimumSize
-	payloadLength := min(originalLength, maxPayloadLength)
-	size := header.IPv4MinimumSize + header.ICMPv4MinimumSize + payloadLength
-	buffer := make([]byte, headroom+size)
-	response := header.IPv4(buffer[headroom:])
-	response.Encode(&header.IPv4Fields{
-		TotalLength: uint16(size),
-		TTL:         synthesizedTTL,
-		Protocol:    uint8(header.ICMPv4ProtocolNumber),
-		SrcAddr:     packet.DestinationAddr(),
-		DstAddr:     packet.SourceAddr(),
-	})
-	response.SetChecksum(^response.CalculateChecksum())
-	icmpHdr := header.ICMPv4(response.Payload())
-	icmpHdr.SetType(header.ICMPv4DstUnreachable)
-	icmpHdr.SetCode(header.ICMPv4FragmentationNeeded)
-	icmpHdr.SetMTU(uint16(min(advertised, uint32(0xffff))))
-	copy(icmpHdr.Payload(), packet[:payloadLength])
-	icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
-	return buffer, true
+	payload := packet.Payload()
+	maxFragmentPayload := (int(effectiveMTU) - header.IPv6MinimumSize - header.IPv6FragmentHeaderSize) &^ 7
+	if maxFragmentPayload <= 0 {
+		return nil, false
+	}
+	transportProtocol := packet.NextHeader()
+	fragments := make([][]byte, 0, (len(payload)+maxFragmentPayload-1)/maxFragmentPayload)
+	for start := 0; start < len(payload); start += maxFragmentPayload {
+		end := min(start+maxFragmentPayload, len(payload))
+		buffer := make([]byte, headroom+header.IPv6MinimumSize+header.IPv6FragmentHeaderSize+end-start)
+		fragment := header.IPv6(buffer[headroom:])
+		copy(fragment, packet[:header.IPv6MinimumSize])
+		fragment.SetNextHeader(header.IPv6FragmentHeader)
+		fragment.SetPayloadLength(uint16(header.IPv6FragmentHeaderSize + end - start))
+		encodeIPv6FragmentHeader(fragment[header.IPv6MinimumSize:], transportProtocol, start, end < len(payload), ident)
+		copy(fragment[header.IPv6MinimumSize+header.IPv6FragmentHeaderSize:], payload[start:end])
+		fragments = append(fragments, buffer)
+	}
+	return fragments, true
 }
 
-func buildPacketTooBig(packet header.IPv6, effectiveMTU uint32, headroom int) ([]byte, bool) {
-	advertised := max(effectiveMTU, header.IPv6MinimumMTU)
-	originalLength := min(header.IPv6MinimumSize+int(packet.PayloadLength()), len(packet))
-	if originalLength < header.IPv6MinimumSize {
-		return nil, false
+func encodeIPv6FragmentHeader(target []byte, nextHeader uint8, offset int, more bool, ident uint32) {
+	target[0] = nextHeader
+	target[1] = 0
+	value := uint16(offset)
+	if more {
+		value |= 1
 	}
-	maxPayloadLength := header.IPv6MinimumMTU - header.IPv6MinimumSize - header.ICMPv6PacketTooBigMinimumSize
-	payloadLength := min(originalLength, maxPayloadLength)
-	size := header.IPv6MinimumSize + header.ICMPv6PacketTooBigMinimumSize + payloadLength
-	buffer := make([]byte, headroom+size)
-	response := header.IPv6(buffer[headroom:])
-	response.Encode(&header.IPv6Fields{
-		PayloadLength:     uint16(header.ICMPv6PacketTooBigMinimumSize + payloadLength),
-		TransportProtocol: header.ICMPv6ProtocolNumber,
-		HopLimit:          synthesizedTTL,
-		SrcAddr:           packet.DestinationAddr(),
-		DstAddr:           packet.SourceAddr(),
-	})
-	icmpHdr := header.ICMPv6(response.Payload())
-	icmpHdr.SetType(header.ICMPv6PacketTooBig)
-	icmpHdr.SetCode(header.ICMPv6UnusedCode)
-	icmpHdr.SetMTU(advertised)
-	copy(icmpHdr.Payload(), packet[:payloadLength])
-	icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
-		Header: icmpHdr,
-		Src:    response.SourceAddressSlice(),
-		Dst:    response.DestinationAddressSlice(),
-	}))
-	return buffer, true
+	binary.BigEndian.PutUint16(target[2:], value)
+	binary.BigEndian.PutUint32(target[4:], ident)
 }

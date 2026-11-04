@@ -48,7 +48,7 @@ func (m *Mixed) Start() error {
 	if err != nil {
 		return err
 	}
-	udpForwarder := NewUDPForwarder(m.ctx, ipStack, m.handler, m.udpNATOptions)
+	udpForwarder := NewUDPForwarder(m.ctx, ipStack, m.handler, m.dispatcher, m.udpNATOptions)
 	err = udpForwarder.Start()
 	if err != nil {
 		return err
@@ -57,6 +57,7 @@ func (m *Mixed) Start() error {
 	m.udpForwarder = udpForwarder
 	m.stack = ipStack
 	m.endpoint = endpoint
+	m.dispatchStage = m.dispatcher.NewStage(nil, func() { m.resumeJudged(m.processPacket) })
 	go m.tunLoop()
 	go m.packetLoop()
 	return nil
@@ -121,13 +122,15 @@ func (m *Mixed) tunLoop() {
 		}
 		rawPacket := packetBuffer[:n]
 		packet := packetBuffer[PacketOffset:n]
+		m.processAccess.Lock()
 		if m.processPacket(packet) {
 			_, err = m.tun.Write(rawPacket)
 			if err != nil {
 				m.logger.Trace(E.Cause(err, "write packet"))
 			}
 		}
-		m.dispatcher.Flush()
+		m.dispatchStage.Flush()
+		m.processAccess.Unlock()
 	}
 }
 
@@ -141,13 +144,15 @@ func (m *Mixed) wintunLoop(winTun WinTun) {
 			release()
 			continue
 		}
+		m.processAccess.Lock()
 		if m.processPacket(packet) {
 			_, err = winTun.Write(packet)
 			if err != nil {
 				m.logger.Trace(E.Cause(err, "write packet"))
 			}
 		}
-		m.dispatcher.Flush()
+		m.dispatchStage.Flush()
+		m.processAccess.Unlock()
 		release()
 	}
 }
@@ -177,6 +182,7 @@ func (m *Mixed) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 		if n == 0 {
 			continue
 		}
+		m.processAccess.Lock()
 		for i := 0; i < n; i++ {
 			packetSize := packetSizes[i]
 			if packetSize < header.IPv4MinimumSize {
@@ -195,7 +201,8 @@ func (m *Mixed) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 			}
 			writeBuffers = writeBuffers[:0]
 		}
-		m.dispatcher.Flush()
+		m.dispatchStage.Flush()
+		m.processAccess.Unlock()
 	}
 }
 
@@ -204,7 +211,7 @@ func (m *Mixed) batchLoopDarwin(darwinTUN DarwinTUN) {
 	var releaseBuffers []*buf.Buffer
 	var readRetry ReadRetry
 	for {
-		buffers, err := darwinTUN.BatchRead()
+		buffers, err := darwinTUN.BatchRead(0, 0)
 		if err != nil {
 			if !IsRecoverableReadError(err) {
 				if !E.IsClosed(err) && !errors.Is(err, syscall.EBADF) {
@@ -222,6 +229,7 @@ func (m *Mixed) batchLoopDarwin(darwinTUN DarwinTUN) {
 		}
 		writeBuffers = writeBuffers[:0]
 		releaseBuffers = releaseBuffers[:0]
+		m.processAccess.Lock()
 		for _, buffer := range buffers {
 			packetSize := buffer.Len()
 			if packetSize < header.IPv4MinimumSize {
@@ -241,7 +249,8 @@ func (m *Mixed) batchLoopDarwin(darwinTUN DarwinTUN) {
 			}
 			buf.ReleaseMulti(writeBuffers)
 		}
-		m.dispatcher.Flush()
+		m.dispatchStage.Flush()
+		m.processAccess.Unlock()
 		buf.ReleaseMulti(releaseBuffers)
 	}
 }
