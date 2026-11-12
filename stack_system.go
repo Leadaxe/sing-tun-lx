@@ -67,6 +67,7 @@ type System struct {
 	frontHeadroom       int
 	txChecksumOffload   bool
 	multiPendingPackets bool
+	identification      atomic.Uint32
 }
 
 type Session struct {
@@ -258,7 +259,7 @@ func (s *System) tunLoop() {
 		if err != nil {
 			if IsRecoverableReadError(err) {
 				s.logger.Debug(E.Cause(err, "read packet"))
-				readRetry.Wait(err)
+				readRetry.Wait()
 				continue
 			}
 			if !E.IsClosed(err) {
@@ -321,7 +322,7 @@ func (s *System) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 				return
 			}
 			s.logger.Debug(E.Cause(err, "batch read packet"))
-			readRetry.Wait(err)
+			readRetry.Wait()
 		} else {
 			readRetry.Reset()
 		}
@@ -364,7 +365,7 @@ func (s *System) batchLoopDarwin(darwinTUN DarwinTUN) {
 				return
 			}
 			s.logger.Debug(E.Cause(err, "batch read packet"))
-			readRetry.Wait(err)
+			readRetry.Wait()
 		} else {
 			readRetry.Reset()
 		}
@@ -763,7 +764,7 @@ func (s *System) processIPv4UDP(ipHdr header.IPv4, udpHdr header.UDP) error {
 	if !destination.Addr.IsGlobalUnicast() {
 		return nil
 	}
-	s.udpNat.NewPacket([][]byte{udpHdr.Payload()}, source, destination, ipHdr)
+	s.udpNat.NewPacket([][]byte{udpHdr.Payload()}, source, destination, nil)
 	return nil
 }
 
@@ -776,34 +777,39 @@ func (s *System) processIPv6UDP(ipHdr header.IPv6, udpHdr header.UDP) error {
 	if !destination.Addr.IsGlobalUnicast() {
 		return nil
 	}
-	s.udpNat.NewPacket([][]byte{udpHdr.Payload()}, source, destination, ipHdr)
+	s.udpNat.NewPacket([][]byte{udpHdr.Payload()}, source, destination, nil)
 	return nil
 }
 
 func (s *System) preparePacketConnection(source M.Socksaddr, destination M.Socksaddr, userData any) (bool, context.Context, N.PacketWriter, N.CloseHandlerFunc) {
 	var writer N.PacketWriter
 	if source.IsIPv4() {
-		packet := userData.(header.IPv4)
-		headerLen := packet.HeaderLength() + header.UDPMinimumSize
-		headerCopy := make([]byte, headerLen)
-		copy(headerCopy, packet[:headerLen])
+		replyHeader := make([]byte, header.IPv4MinimumSize+header.UDPMinimumSize)
+		header.IPv4(replyHeader).Encode(&header.IPv4Fields{
+			TTL:      synthesizedTTL,
+			Protocol: uint8(header.UDPProtocolNumber),
+			DstAddr:  source.Addr,
+		})
+		header.UDP(replyHeader[header.IPv4MinimumSize:]).SetDestinationPort(source.Port)
 		writer = &systemUDPPacketWriter4{
 			s.tun,
 			s.frontHeadroom + PacketOffset,
-			headerCopy,
-			source.AddrPort(),
+			replyHeader,
+			&s.identification,
 			s.txChecksumOffload,
 		}
 	} else {
-		packet := userData.(header.IPv6)
-		headerLen := len(packet) - int(packet.PayloadLength()) + header.UDPMinimumSize
-		headerCopy := make([]byte, headerLen)
-		copy(headerCopy, packet[:headerLen])
+		replyHeader := make([]byte, header.IPv6MinimumSize+header.UDPMinimumSize)
+		header.IPv6(replyHeader).Encode(&header.IPv6Fields{
+			TransportProtocol: header.UDPProtocolNumber,
+			HopLimit:          synthesizedTTL,
+			DstAddr:           source.Addr,
+		})
+		header.UDP(replyHeader[header.IPv6MinimumSize:]).SetDestinationPort(source.Port)
 		writer = &systemUDPPacketWriter6{
 			s.tun,
 			s.frontHeadroom + PacketOffset,
-			headerCopy,
-			source.AddrPort(),
+			replyHeader,
 			s.txChecksumOffload,
 		}
 	}
@@ -852,7 +858,7 @@ type systemUDPPacketWriter4 struct {
 	tun               Tun
 	frontHeadroom     int
 	header            []byte
-	source            netip.AddrPort
+	identification    *atomic.Uint32
 	txChecksumOffload bool
 }
 
@@ -866,10 +872,9 @@ func (w *systemUDPPacketWriter4) preparePacket(buffer *buf.Buffer, destination M
 	copy(buffer.ExtendHeader(len(w.header)), w.header)
 	ipHdr := header.IPv4(buffer.Bytes())
 	ipHdr.SetTotalLength(uint16(buffer.Len()))
-	ipHdr.SetDestinationAddress(ipHdr.SourceAddress())
+	ipHdr.SetID(uint16(w.identification.Add(1)))
 	ipHdr.SetSourceAddr(destination.Addr)
 	udpHdr := header.UDP(ipHdr.Payload())
-	udpHdr.SetDestinationPort(udpHdr.SourcePort())
 	udpHdr.SetSourcePort(destination.Port)
 	udpHdr.SetLength(uint16(payloadLen + header.UDPMinimumSize))
 	if !w.txChecksumOffload {
@@ -945,7 +950,6 @@ type systemUDPPacketWriter6 struct {
 	tun               Tun
 	frontHeadroom     int
 	header            []byte
-	source            netip.AddrPort
 	txChecksumOffload bool
 }
 
@@ -960,10 +964,8 @@ func (w *systemUDPPacketWriter6) preparePacket(buffer *buf.Buffer, destination M
 	ipHdr := header.IPv6(buffer.Bytes())
 	udpLen := uint16(header.UDPMinimumSize + payloadLen)
 	ipHdr.SetPayloadLength(udpLen)
-	ipHdr.SetDestinationAddress(ipHdr.SourceAddress())
 	ipHdr.SetSourceAddr(destination.Addr)
 	udpHdr := header.UDP(ipHdr.Payload())
-	udpHdr.SetDestinationPort(udpHdr.SourcePort())
 	udpHdr.SetSourcePort(destination.Port)
 	udpHdr.SetLength(udpLen)
 	if !w.txChecksumOffload {
