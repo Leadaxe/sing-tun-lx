@@ -3,6 +3,7 @@ package tun
 import (
 	"math"
 	"net/netip"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-tun/gtcpip/checksum"
 	"github.com/sagernet/sing-tun/gtcpip/header"
@@ -13,15 +14,17 @@ import (
 
 func (d *ForwardDispatcher) hijackDNSPacket(packet *forwardPacket) {
 	writer := &dnsResponseWriter{
-		writeback: d.writeback,
-		source:    packet.source,
+		writeback:      d.writeback,
+		identification: &d.identification,
+		source:         packet.source,
 	}
 	d.handler.NewDNSPacket(header.UDP(packet.transport).Payload(), M.SocksaddrFromNetIP(packet.source), M.SocksaddrFromNetIP(packet.destination), writer)
 }
 
 type dnsResponseWriter struct {
-	writeback ForwardWriteback
-	source    netip.AddrPort
+	writeback      ForwardWriteback
+	identification *atomic.Uint32
+	source         netip.AddrPort
 }
 
 func (w *dnsResponseWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
@@ -50,6 +53,7 @@ func (w *dnsResponseWriter) WritePacket(buffer *buf.Buffer, destination M.Socksa
 		inet4Hdr := header.IPv4(packet[headroom:])
 		inet4Hdr.Encode(&header.IPv4Fields{
 			TotalLength: uint16(size),
+			ID:          uint16(w.identification.Add(1)),
 			TTL:         synthesizedTTL,
 			Protocol:    uint8(header.UDPProtocolNumber),
 			SrcAddr:     destinationAddr,

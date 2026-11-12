@@ -43,7 +43,7 @@ func segmentTCP(output relayOutput, packet *forwardPacket, raw []byte, headerLen
 		CsumStart:  uint16(len(raw) - len(packet.transport)),
 		CsumOffset: header.TCPChecksumOffset,
 		GSOSize:    uint16(segmentSize),
-	}, buffers, sizes, headroom)
+	}, 0, buffers, sizes, headroom)
 	if err != nil {
 		return err
 	}

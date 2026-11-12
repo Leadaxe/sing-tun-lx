@@ -108,7 +108,7 @@ func (m *Mixed) tunLoop() {
 		if err != nil {
 			if IsRecoverableReadError(err) {
 				m.logger.Debug(E.Cause(err, "read packet"))
-				readRetry.Wait(err)
+				readRetry.Wait()
 				continue
 			}
 			if !E.IsClosed(err) {
@@ -175,7 +175,7 @@ func (m *Mixed) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
 				return
 			}
 			m.logger.Debug(E.Cause(err, "batch read packet"))
-			readRetry.Wait(err)
+			readRetry.Wait()
 		} else {
 			readRetry.Reset()
 		}
@@ -220,7 +220,7 @@ func (m *Mixed) batchLoopDarwin(darwinTUN DarwinTUN) {
 				return
 			}
 			m.logger.Debug(E.Cause(err, "batch read packet"))
-			readRetry.Wait(err)
+			readRetry.Wait()
 		} else {
 			readRetry.Reset()
 		}

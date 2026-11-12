@@ -290,7 +290,7 @@ func (e *goEngine) run() {
 					return
 				}
 				e.stack.logger.Debug(E.Cause(err, "go: engine read"))
-				readRetry.Wait(err)
+				readRetry.Wait()
 			} else {
 				readRetry.Reset()
 			}

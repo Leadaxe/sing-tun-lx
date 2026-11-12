@@ -165,6 +165,18 @@ func (r *autoRedirect) nftablesCreateExcludeRules(nft *nftables.Conn, table *nft
 					},
 				},
 			})
+			nft.AddRule(&nftables.Rule{
+				Table: table,
+				Chain: chain,
+				Exprs: []expr.Any{
+					&expr.Ct{Key: expr.CtKeyDIRECTION, Register: 1},
+					&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{1}},
+					&expr.Ct{Key: expr.CtKeyMARK, Register: 1},
+					&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(r.tunOptions.AutoRedirectInputMark)},
+					&expr.Counter{},
+					&expr.Verdict{Kind: expr.VerdictReturn},
+				},
+			})
 		}
 	}
 	if chain.Type == nftables.ChainTypeNAT {
@@ -630,6 +642,16 @@ func (r *autoRedirect) nftablesCreateExcludeRules(nft *nftables.Conn, table *nft
 	if r.enableIPv6 {
 		nftablesCreateExcludeDestinationIPSet(nft, table, chain, 6, "inet6_local_address_set", nftables.TableFamilyIPv6, false)
 	}
+	nft.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: chain,
+		Exprs: []expr.Any{
+			&expr.Fib{Register: 1, FlagDADDR: true, ResultADDRTYPE: true},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(unix.RTN_LOCAL)},
+			&expr.Counter{},
+			&expr.Verdict{Kind: expr.VerdictReturn},
+		},
+	})
 
 	if chain.Type == nftables.ChainTypeNAT || r.tunOptions.ExcludeMPTCP {
 		mptcpVerdict := expr.VerdictDrop

@@ -262,6 +262,12 @@ func (r *autoRedirect) iptablesFillLocalChain(chain iptablesLocalChain, addresse
 			return err
 		}
 	}
+	if runtime.GOOS != "android" {
+		err := iptablesRun(chain.family.path, "-t", chain.table, "-A", chain.name, "-m", "addrtype", "--dst-type", "LOCAL", "-j", "RETURN")
+		if err != nil {
+			return err
+		}
+	}
 	return iptablesRun(chain.family.path, "-t", chain.table, "-A", chain.name, "-j", chain.next)
 }
 
@@ -302,6 +308,7 @@ func (r *autoRedirect) iptablesAddExcludeRules(builder *iptablesBuilder, hook ip
 		builder.add("-m", "mark", "--mark", outputMark, "-j", "RETURN")
 		if kind == iptablesKindRoute {
 			builder.add("-m", "connmark", "--mark", outputMark, "-j", "RETURN")
+			builder.add("-m", "conntrack", "--ctdir", "REPLY", "-m", "connmark", "!", "--mark", iptablesMark(options.AutoRedirectInputMark, mask), "-j", "RETURN")
 		}
 	}
 	if kind == iptablesKindNAT {
@@ -362,8 +369,14 @@ func (r *autoRedirect) iptablesAddPreMatchRules(builder *iptablesBuilder, hook i
 		if r.androidVPNService {
 			builder.add("!", "-o", options.Name, "-j", "RETURN")
 		}
+		icmpProtocol := "icmp"
+		if builder.family.isIPv6 {
+			icmpProtocol = "icmpv6"
+		}
+		builder.add("!", "-p", icmpProtocol, "-m", "conntrack", "--ctdir", "REPLY", "-m", "connmark", "--mark", inputMark, "-j", "MARK", "--set-xmark", inputMark)
 	} else {
 		builder.add("-i", "lo", "-j", "RETURN")
+		builder.add("-i", options.Name, "-m", "conntrack", "--ctdir", "ORIGINAL", "-j", "CONNMARK", "--set-xmark", inputMark)
 		r.iptablesAddOwnIngressReturn(builder)
 	}
 	builder.add("-m", "conntrack", "--ctdir", "REPLY", "-j", "RETURN")

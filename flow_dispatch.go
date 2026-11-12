@@ -167,6 +167,7 @@ type ForwardDispatcher struct {
 	stages          []*ForwardStage
 	stageCount      atomic.Int32
 	resetGeneration atomic.Uint32
+	identification  atomic.Uint32
 }
 
 type stagedPort struct {
