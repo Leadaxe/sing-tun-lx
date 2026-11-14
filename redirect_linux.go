@@ -11,6 +11,8 @@ import (
 
 	"github.com/sagernet/netlink"
 	"github.com/sagernet/nftables"
+	"github.com/sagernet/nftables/binaryutil"
+	"github.com/sagernet/nftables/expr"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -50,6 +52,8 @@ type autoRedirect struct {
 	useNFTables                  bool
 	androidVPNService            bool
 	nfqueueHandler               *nfqueueHandler
+	preroutingReject             bool
+	fibAddrType                  bool
 	iptablesAccess               sync.Mutex
 	iptablesLocalChains          []iptablesLocalChain
 	redirectRouteTableIndex      int
@@ -237,7 +241,12 @@ func (r *autoRedirect) initializeBackend() error {
 	if r.useNFTables {
 		err = runInNetworkNamespace(r.tunOptions.NetNs, r.initializeNFTables)
 		if err != nil {
-			return E.Cause(err, "missing nftables support")
+			_, lookErr := exec.LookPath("iptables")
+			if r.tunOptions.NetNs != "" || r.tunOptions.ExcludeMPTCP || lookErr != nil {
+				return E.Cause(err, "missing nftables support")
+			}
+			r.logger.Warn("nftables not available, fallback to iptables: ", err)
+			r.useNFTables = false
 		}
 	}
 	if len(r.tunOptions.Inet4Address) > 0 {
@@ -323,10 +332,6 @@ func (r *autoRedirect) startRedirectServer() error {
 const tcpOptionMultipathTCP = 30
 
 func (r *autoRedirect) startNFQueue() error {
-	var markMask uint32
-	if !r.useNFTables {
-		markMask = r.effectiveMarkMask()
-	}
 	var tproxyMark uint32
 	if r.tproxyEnabled() {
 		tproxyMark = r.tunOptions.AutoRedirectTProxyMark
@@ -339,7 +344,7 @@ func (r *autoRedirect) startNFQueue() error {
 		outputMark: r.tunOptions.AutoRedirectOutputMark,
 		resetMark:  r.tunOptions.AutoRedirectResetMark,
 		tproxyMark: tproxyMark,
-		markMask:   markMask,
+		markMask:   r.effectiveMarkMask(),
 		// A queue verdict leaves the whole iptables mangle hook, while nftables base chains
 		// continue on NF_ACCEPT.
 		repeatOnAccept: !r.useNFTables,
@@ -419,6 +424,29 @@ func (r *autoRedirect) initializeNFTables() error {
 	_, err = nft.ListTablesOfFamily(nftables.TableFamilyIPv4)
 	if err != nil {
 		return err
+	}
+	err = r.nftablesProbe(nftables.ChainTypeNAT)
+	if err != nil {
+		return E.Cause(err, "create inet nat chain (Linux 5.2 or later is required)")
+	}
+	err = r.nftablesProbe(nftables.ChainTypeFilter, &expr.Reject{Type: unix.NFT_REJECT_TCP_RST})
+	if err != nil {
+		r.logger.Debug("reject in prerouting is not supported (Linux 5.9 or later is required), reject in input and forward instead: ", err)
+	} else {
+		r.preroutingReject = true
+	}
+	err = r.nftablesProbe(nftables.ChainTypeFilter,
+		&expr.Fib{Register: 1, FlagDADDR: true, ResultADDRTYPE: true},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(unix.RTN_LOCAL)},
+	)
+	if err != nil {
+		r.logger.Warn("fib expression not available, local addresses are excluded by address sets only (missing nft_fib_inet kernel module?): ", err)
+	} else {
+		r.fibAddrType = true
+	}
+	err = r.nftablesProbe(nftables.ChainTypeFilter, &expr.Queue{Num: r.effectiveNFQueue(), Flag: expr.QueueFlagBypass})
+	if err != nil {
+		return E.Cause(err, "create queue rule (missing nft_queue kernel module?)")
 	}
 	r.useNFTables = true
 	return nil

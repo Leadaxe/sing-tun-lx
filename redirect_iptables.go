@@ -541,7 +541,7 @@ func (r *autoRedirect) setupIPTablesForFamily(family *iptablesFamily) error {
 	if family.isIPv6 && !family.tproxy {
 		preroutingMarkChain.add("-p", "tcp", "-m", "mark", "--mark", resetMark, "-j", "RETURN")
 	}
-	preroutingMarkChain.add("-m", "connmark", "--mark", inputMark, "-j", "MARK", "--set-xmark", inputMark)
+	preroutingMarkChain.add("-m", "connmark", "--mark", inputMark, "-m", "conntrack", "--ctdir", "ORIGINAL", "-j", "MARK", "--set-xmark", inputMark)
 	preroutingMarkChain.add("-m", "connmark", "--mark", inputMark, "-j", "RETURN")
 	preroutingMarkChain.add("-m", "connmark", "--mark", outputMark, "-j", "MARK", "--set-xmark", outputMark)
 	preroutingMarkChain.add("-m", "connmark", "--mark", outputMark, "-j", "RETURN")
@@ -601,10 +601,13 @@ func (r *autoRedirect) setupIPTablesForFamily(family *iptablesFamily) error {
 			return preroutingNAT.err
 		}
 		inserts = append(inserts, iptablesInsert{iptablesTableNAT, "PREROUTING", []string{"-j", preroutingNAT.name}})
+		// Qualcomm QoS chains in mangle POSTROUTING (qcom_qos_reset_POSTROUTING)
+		// overwrite the whole packet mark on rmnet egress, so the postrouting
+		// rules match the connmark.
 		if r.androidVPNService {
 			postroutingNAT := r.iptablesChain(family, iptablesTableNAT, r.tableName+"-postrouting")
 			for _, prefix := range options.Inet4Address {
-				postroutingNAT.add("-s", prefix.Masked().String(), "!", "-o", options.Name, "-m", "mark", "--mark", outputMark, "-j", "MASQUERADE")
+				postroutingNAT.add("-s", prefix.Masked().String(), "!", "-o", options.Name, "-m", "connmark", "--mark", outputMark, "-j", "MASQUERADE")
 			}
 			if postroutingNAT.err != nil {
 				return postroutingNAT.err
@@ -612,7 +615,7 @@ func (r *autoRedirect) setupIPTablesForFamily(family *iptablesFamily) error {
 			inserts = append(inserts, iptablesInsert{iptablesTableNAT, "POSTROUTING", []string{"-j", postroutingNAT.name}})
 			postroutingMangle := r.iptablesChain(family, iptablesTableMangle, r.tableName+"-postrouting")
 			for _, prefix := range options.Inet4Address {
-				postroutingMangle.add("-s", prefix.Masked().String(), "!", "-o", options.Name, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "mark", "--mark", outputMark, "-j", "TCPMSS", "--clamp-mss-to-pmtu")
+				postroutingMangle.add("-s", prefix.Masked().String(), "!", "-o", options.Name, "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-m", "connmark", "--mark", outputMark, "-j", "TCPMSS", "--clamp-mss-to-pmtu")
 			}
 			if postroutingMangle.err != nil {
 				return postroutingMangle.err
