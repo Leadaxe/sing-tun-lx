@@ -124,7 +124,7 @@ func (r *autoRedirect) setupNFTables() error {
 	}
 
 	resetEnabled := r.nftablesResetEnabled()
-	if r.redirectServer != nil || resetEnabled {
+	if r.redirectServer != nil || r.redirectDNSServer != nil || resetEnabled {
 		inputPriority := nftables.ChainPriorityFilter
 		if resetEnabled {
 			inputPriority = nftables.ChainPriorityMangle
@@ -137,7 +137,11 @@ func (r *autoRedirect) setupNFTables() error {
 			Type:     nftables.ChainTypeFilter,
 		})
 		if r.redirectServer != nil {
-			r.nftablesCreateRedirectPortReject(nft, table, chainInput)
+			r.nftablesCreateRedirectPortReject(nft, table, chainInput, unix.IPPROTO_TCP, r.redirectPort())
+		}
+		if r.redirectDNSServer != nil {
+			r.nftablesCreateRedirectPortReject(nft, table, chainInput, unix.IPPROTO_TCP, r.redirectDNSServer.tcpPort())
+			r.nftablesCreateRedirectPortReject(nft, table, chainInput, unix.IPPROTO_UDP, r.redirectDNSServer.udpPort())
 		}
 		if resetEnabled {
 			r.nftablesCreateResetReject(nft, table, chainInput)
@@ -244,7 +248,7 @@ func (r *autoRedirect) setupNFTables() error {
 					&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0}},
 					&expr.Counter{},
 				},
-				r.nftablesMarkSet(true, r.tunOptions.AutoRedirectInputMark),
+				r.nftablesMarkSet(true, r.tunFlowMark()),
 			),
 		})
 		nft.AddRule(&nftables.Rule{
@@ -292,7 +296,21 @@ func (r *autoRedirect) setupNFTables() error {
 			Table: table,
 			Chain: chainPreRoutingUDP,
 			Exprs: slices.Concat(
+				[]expr.Any{
+					&expr.Ct{Key: expr.CtKeyDIRECTION, Register: 1},
+					&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{1}},
+				},
+				r.nftablesMarkMatch(true, expr.CmpOpEq, r.tunFlowMark()),
+				r.nftablesMarkSet(false, r.tunOptions.AutoRedirectInputMark),
+				[]expr.Any{&expr.Counter{}, &expr.Verdict{Kind: expr.VerdictReturn}},
+			),
+		})
+		nft.AddRule(&nftables.Rule{
+			Table: table,
+			Chain: chainPreRoutingUDP,
+			Exprs: slices.Concat(
 				r.nftablesMarkMatch(true, expr.CmpOpNeq, r.tunOptions.AutoRedirectInputMark),
+				r.nftablesMarkMatch(true, expr.CmpOpNeq, r.tunFlowMark()),
 				r.nftablesMarkSet(false, r.tunOptions.AutoRedirectOutputMark),
 				[]expr.Any{&expr.Counter{}},
 				r.nftablesMarkSet(true, r.tunOptions.AutoRedirectOutputMark),

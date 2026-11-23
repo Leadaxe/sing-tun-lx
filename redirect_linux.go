@@ -2,6 +2,7 @@ package tun
 
 import (
 	"context"
+	"math"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -38,6 +39,7 @@ type autoRedirect struct {
 	customRedirectPortFunc  func() int
 	customRedirectPort      int
 	redirectServer          *redirectServer
+	redirectDNSServer       *redirectDNSServer
 	enableIPv4              bool
 	enableIPv6              bool
 	iptablesPath            string
@@ -168,6 +170,21 @@ func (r *autoRedirect) Start() error {
 		}
 		r.redirectServer = server
 	}
+	if r.handler != nil && r.enableIPv6 && r.tunOptions.DNSModeOrDefault() == DNSModeHijack {
+		var dnsServers []netip.Addr
+		dnsServers, err = r.tunOptions.Inet6DNSAddress()
+		if err != nil {
+			return err
+		}
+		if len(dnsServers) > 0 {
+			server := newRedirectDNSServer(r.ctx, r.handler, r.logger, dnsServers[0])
+			err = runInNetworkNamespace(r.tunOptions.NetNs, server.Start)
+			if err != nil {
+				return E.Cause(err, "start redirect DNS server")
+			}
+			r.redirectDNSServer = server
+		}
+	}
 	if r.useNFTables {
 		if r.handler != nil {
 			var handler *nfqueueHandler
@@ -184,7 +201,7 @@ func (r *autoRedirect) Start() error {
 				InputMark:  r.tunOptions.AutoRedirectInputMark,
 				OutputMark: r.effectiveOutputMark(),
 				ResetMark:  r.effectiveResetMark(),
-				MarkMask:   r.effectiveMarkMask(),
+				MarkMask:   r.packetMarkMask,
 			}); err != nil {
 				r.logger.Warn("nfqueue not available, pre-match disabled (missing nfnetlink_queue and nft_queue kernel module?): ", err)
 			} else if err = runInNetworkNamespace(r.tunOptions.NetNs, handler.Start); err != nil {
@@ -236,7 +253,7 @@ func (r *autoRedirect) Start() error {
 }
 
 func (r *autoRedirect) Close() error {
-	err := common.Close(common.PtrOrNil(r.redirectServer))
+	err := common.Close(common.PtrOrNil(r.redirectServer), common.PtrOrNil(r.redirectDNSServer))
 	if r.nfqueueHandler != nil {
 		r.nfqueueHandler.Close()
 	}
@@ -320,6 +337,24 @@ func (r *autoRedirect) effectiveResetMark() uint32 {
 
 func (r *autoRedirect) effectiveMarkMask() uint32 {
 	return r.tunOptions.AutoRedirectInputMark | r.effectiveOutputMark() | r.effectiveResetMark()
+}
+
+func (r *autoRedirect) packetMarkMask(mark uint32) uint32 {
+	if mark == r.tunOptions.AutoRedirectInputMark || mark == r.effectiveResetMark() {
+		return math.MaxUint32
+	}
+	return r.effectiveMarkMask()
+}
+
+func (r *autoRedirect) tunFlowMark() uint32 {
+	inputMark := r.tunOptions.AutoRedirectInputMark
+	outputMark := r.effectiveOutputMark()
+	for _, mark := range []uint32{r.effectiveMarkMask(), r.effectiveResetMark()} {
+		if mark != inputMark && mark != outputMark {
+			return mark
+		}
+	}
+	return inputMark
 }
 
 func (r *autoRedirect) effectiveNFQueue() uint16 {
