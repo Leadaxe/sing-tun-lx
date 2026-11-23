@@ -2,6 +2,7 @@ package tun
 
 import (
 	"context"
+	"math"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -45,6 +46,7 @@ type autoRedirect struct {
 	bypassIncludeAddresses       []netip.Prefix
 	bypassExcludeAddresses       []netip.Prefix
 	redirectServer               *RedirectServer
+	redirectDNSServer            *redirectDNSServer
 	enableIPv4                   bool
 	enableIPv6                   bool
 	iptablesPath                 string
@@ -102,17 +104,35 @@ func NewAutoRedirect(options AutoRedirectOptions) (AutoRedirect, error) {
 		}
 		*mark.field = value
 	}
+	err := r.initializeBackend()
+	if err != nil {
+		return nil, err
+	}
+	r.tunOptions.AutoRedirectInputMarkMask = r.packetMarkMask(r.tunOptions.AutoRedirectInputMark)
 	return r, nil
 }
 
 func (r *autoRedirect) Start() error {
-	err := r.initializeBackend()
+	err := r.startRedirectServer()
 	if err != nil {
 		return err
 	}
-	err = r.startRedirectServer()
-	if err != nil {
-		return err
+	if r.redirectServer != nil && r.useNFTables && r.enableIPv6 && r.tunOptions.DNSModeOrDefault() == DNSModeHijack {
+		var dnsServers []netip.Addr
+		dnsServers, err = r.tunOptions.Inet6DNSAddress()
+		if err != nil {
+			_ = r.Close()
+			return err
+		}
+		if len(dnsServers) > 0 {
+			server := newRedirectDNSServer(r.ctx, r.handler, r.logger, dnsServers[0])
+			err = runInNetworkNamespace(r.tunOptions.NetNs, server.Start)
+			if err != nil {
+				_ = r.Close()
+				return E.Cause(err, "start redirect DNS server")
+			}
+			r.redirectDNSServer = server
+		}
 	}
 	err = r.startNFQueue()
 	if err != nil {
@@ -344,7 +364,7 @@ func (r *autoRedirect) startNFQueue() error {
 		outputMark: r.tunOptions.AutoRedirectOutputMark,
 		resetMark:  r.tunOptions.AutoRedirectResetMark,
 		tproxyMark: tproxyMark,
-		markMask:   r.effectiveMarkMask(),
+		markMask:   r.packetMarkMask,
 		// A queue verdict leaves the whole iptables mangle hook, while nftables base chains
 		// continue on NF_ACCEPT.
 		repeatOnAccept: !r.useNFTables,
@@ -388,6 +408,10 @@ func (r *autoRedirect) Close() error {
 	if r.redirectServer != nil {
 		err = r.redirectServer.Close()
 		r.redirectServer = nil
+	}
+	if r.redirectDNSServer != nil {
+		err = E.Errors(err, r.redirectDNSServer.Close())
+		r.redirectDNSServer = nil
 	}
 	if r.useNFTables {
 		_ = runInNetworkNamespace(r.tunOptions.NetNs, func() error {
@@ -474,6 +498,23 @@ const (
 
 func (r *autoRedirect) effectiveMarkMask() uint32 {
 	return r.tunOptions.AutoRedirectInputMark | r.tunOptions.AutoRedirectOutputMark | r.tunOptions.AutoRedirectResetMark | r.tunOptions.AutoRedirectTProxyMark
+}
+
+func (r *autoRedirect) packetMarkMask(mark uint32) uint32 {
+	if r.useNFTables && (mark == r.tunOptions.AutoRedirectInputMark || mark == r.tunOptions.AutoRedirectResetMark) {
+		return math.MaxUint32
+	}
+	return r.effectiveMarkMask()
+}
+
+func (r *autoRedirect) tunFlowMark() uint32 {
+	options := r.tunOptions
+	for _, mark := range []uint32{r.effectiveMarkMask(), options.AutoRedirectResetMark} {
+		if mark != options.AutoRedirectInputMark && mark != options.AutoRedirectOutputMark && mark != options.AutoRedirectTProxyMark {
+			return mark
+		}
+	}
+	return options.AutoRedirectInputMark
 }
 
 func (r *autoRedirect) effectiveNFQueue() uint16 {
