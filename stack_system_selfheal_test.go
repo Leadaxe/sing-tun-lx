@@ -28,7 +28,7 @@ func newSelfHealTestSystem(t *testing.T) *System {
 		inet4Address: netip.MustParseAddr("127.0.0.1"),
 		udpTimeout:   time.Minute,
 	}
-	s.tcpNat4 = NewNat(s.ctx, s.udpTimeout)
+	s.tcpNat4 = NewNat(s.ctx)
 	ln, err := s.listenTCP(false)
 	if err != nil {
 		t.Fatalf("listenTCP: %v", err)

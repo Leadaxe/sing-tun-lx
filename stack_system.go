@@ -161,7 +161,9 @@ func (s *System) Start() error {
 // relisten path. isIPv6 selects the address family; the bind-to-interface
 // Control and the EADDRNOTAVAIL retry loop match the original start() code.
 func (s *System) listenTCP(isIPv6 bool) (net.Listener, error) {
-	var listener net.ListenConfig
+	listener := net.ListenConfig{
+		KeepAliveConfig: net.KeepAliveConfig{Enable: true, Idle: 2 * time.Hour, Interval: 75 * time.Second, Count: 9},
+	}
 	if s.bindInterface {
 		listener.Control = control.Append(listener.Control, func(network, address string, conn syscall.RawConn) error {
 			bindErr := control.BindToInterface0(s.interfaceFinder, conn, network, address, s.tunName, -1, true)
@@ -205,7 +207,7 @@ func (s *System) start() error {
 		}
 		s.tcpListener = tcpListener
 		s.tcpPort.Store(uint32(M.SocksaddrFromNet(tcpListener.Addr()).Port))
-		s.tcpNat4 = NewNat(s.ctx, s.udpTimeout)
+		s.tcpNat4 = NewNat(s.ctx)
 		go s.acceptLoop(tcpListener, s.tcpNat4, false)
 	}
 	if s.inet6NextAddress.IsValid() {
@@ -215,7 +217,7 @@ func (s *System) start() error {
 		}
 		s.tcpListener6 = tcpListener
 		s.tcpPort6.Store(uint32(M.SocksaddrFromNet(tcpListener.Addr()).Port))
-		s.tcpNat6 = NewNat(s.ctx, s.udpTimeout)
+		s.tcpNat6 = NewNat(s.ctx)
 		go s.acceptLoop(tcpListener, s.tcpNat6, true)
 	}
 	udpNATOptions := s.udpNATOptions
@@ -447,6 +449,9 @@ func (s *System) acceptLoop(listener net.Listener, tcpNat *TCPNat, isIPv6 bool) 
 			s.logger.Trace(E.New("unknown session with port ", connPort))
 			continue
 		}
+		session.Lock()
+		session.established = true
+		session.Unlock()
 		go s.handler.NewConnectionEx(s.ctx, conn, M.SocksaddrFromNetIP(session.Source), M.SocksaddrFromNetIP(session.Destination), nil)
 	}
 }
@@ -543,7 +548,6 @@ func (s *System) processIPv4(ipHdr header.IPv4) (writeBack bool, err error) {
 	if s.dispatchIPv4(ipHdr, destination) {
 		return false, nil
 	}
-	writeBack = true
 	switch ipHdr.TransportProtocol() {
 	case header.TCPProtocolNumber:
 		writeBack, err = s.processIPv4TCP(ipHdr, ipHdr.Payload())
@@ -552,6 +556,8 @@ func (s *System) processIPv4(ipHdr header.IPv4) (writeBack bool, err error) {
 		err = s.processIPv4UDP(ipHdr, ipHdr.Payload())
 	case header.ICMPv4ProtocolNumber:
 		writeBack, err = s.processIPv4ICMP(ipHdr, ipHdr.Payload())
+	default:
+		writeBack = false
 	}
 	if err != nil {
 		writeBack = false
@@ -571,7 +577,6 @@ func (s *System) processIPv6(ipHdr header.IPv6) (writeBack bool, err error) {
 	if s.dispatchIPv6(ipHdr, destination) {
 		return false, nil
 	}
-	writeBack = true
 	switch ipHdr.TransportProtocol() {
 	case header.TCPProtocolNumber:
 		writeBack, err = s.processIPv6TCP(ipHdr, ipHdr.Payload())
@@ -580,6 +585,8 @@ func (s *System) processIPv6(ipHdr header.IPv6) (writeBack bool, err error) {
 		err = s.processIPv6UDP(ipHdr, ipHdr.Payload())
 	case header.ICMPv6ProtocolNumber:
 		writeBack, err = s.processIPv6ICMP(ipHdr, ipHdr.Payload())
+	default:
+		writeBack = false
 	}
 	if err != nil {
 		writeBack = false
