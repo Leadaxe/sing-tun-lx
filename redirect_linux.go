@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -46,7 +47,6 @@ type autoRedirect struct {
 	bypassIncludeAddresses       []netip.Prefix
 	bypassExcludeAddresses       []netip.Prefix
 	redirectServer               *RedirectServer
-	redirectDNSServer            *redirectDNSServer
 	enableIPv4                   bool
 	enableIPv6                   bool
 	iptablesPath                 string
@@ -68,6 +68,7 @@ type autoRedirect struct {
 	androidIngressDiscardValues  map[netip.Addr][8]byte
 	dockerFirewallMonitor        *nftables.Monitor
 	dockerFirewallDone           chan struct{}
+	forwardingRestore            []sysctlState
 }
 
 func NewAutoRedirect(options AutoRedirectOptions) (AutoRedirect, error) {
@@ -89,16 +90,15 @@ func NewAutoRedirect(options AutoRedirectOptions) (AutoRedirect, error) {
 		r.interfaceFinder = &networkNamespaceInterfaceFinder{control.NewDefaultInterfaceFinder(), options.TunOptions}
 	}
 	for _, mark := range []struct {
-		field               *uint32
-		defaultValue        uint32
-		androidDefaultValue uint32
+		field        *uint32
+		defaultValue uint32
 	}{
-		{&r.tunOptions.AutoRedirectInputMark, DefaultAutoRedirectInputMark, DefaultAutoRedirectInputMarkAndroid},
-		{&r.tunOptions.AutoRedirectOutputMark, DefaultAutoRedirectOutputMark, DefaultAutoRedirectOutputMarkAndroid},
-		{&r.tunOptions.AutoRedirectResetMark, DefaultAutoRedirectResetMark, DefaultAutoRedirectResetMarkAndroid},
-		{&r.tunOptions.AutoRedirectTProxyMark, DefaultAutoRedirectTProxyMark, DefaultAutoRedirectTProxyMarkAndroid},
+		{&r.tunOptions.AutoRedirectInputMark, DefaultAutoRedirectInputMark},
+		{&r.tunOptions.AutoRedirectOutputMark, DefaultAutoRedirectOutputMark},
+		{&r.tunOptions.AutoRedirectResetMark, DefaultAutoRedirectResetMark},
+		{&r.tunOptions.AutoRedirectTProxyMark, DefaultAutoRedirectTProxyMark},
 	} {
-		value := effectiveMark(*mark.field, mark.defaultValue, mark.androidDefaultValue)
+		value := effectiveMark(*mark.field, mark.defaultValue)
 		if *mark.field != 0 && *mark.field != value {
 			r.logger.Warn("configured mark ", iptablesHex(*mark.field), " overlaps the fwmark bits reserved by Android and is replaced by ", iptablesHex(value))
 		}
@@ -116,23 +116,6 @@ func (r *autoRedirect) Start() error {
 	err := r.startRedirectServer()
 	if err != nil {
 		return err
-	}
-	if r.redirectServer != nil && r.useNFTables && r.enableIPv6 && r.tunOptions.DNSModeOrDefault() == DNSModeHijack {
-		var dnsServers []netip.Addr
-		dnsServers, err = r.tunOptions.Inet6DNSAddress()
-		if err != nil {
-			_ = r.Close()
-			return err
-		}
-		if len(dnsServers) > 0 {
-			server := newRedirectDNSServer(r.ctx, r.handler, r.logger, dnsServers[0])
-			err = runInNetworkNamespace(r.tunOptions.NetNs, server.Start)
-			if err != nil {
-				_ = r.Close()
-				return E.Cause(err, "start redirect DNS server")
-			}
-			r.redirectDNSServer = server
-		}
 	}
 	err = r.startNFQueue()
 	if err != nil {
@@ -168,6 +151,7 @@ func (r *autoRedirect) Start() error {
 					return E.Cause(setupErr, "setup redirect routes")
 				}
 			}
+			r.enableForwarding()
 			return nil
 		})
 		if err != nil {
@@ -195,6 +179,7 @@ func (r *autoRedirect) Start() error {
 		_ = r.Close()
 		return E.Cause(err, "setup iptables")
 	}
+	r.enableForwarding()
 	r.registerNetworkCallback(func() {
 		updateErr := r.updateIPTablesNetwork()
 		if updateErr != nil {
@@ -308,7 +293,7 @@ func (r *autoRedirect) prepareCustomTransparentListener() error {
 	if err != nil {
 		return E.Cause(err, "set IPV6_TRANSPARENT")
 	}
-	err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_MARK, int(r.tunOptions.AutoRedirectOutputMark))
+	err = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_MARK, int(r.tunOptions.AutoRedirectOutputMark|androidSecureVPNMask))
 	if err != nil {
 		return E.Cause(err, "set SO_MARK")
 	}
@@ -340,6 +325,9 @@ func (r *autoRedirect) startRedirectServer() error {
 	if r.tproxyEnabled() {
 		server.transparent = true
 		server.listenMark = r.tunOptions.AutoRedirectOutputMark
+	}
+	if r.useNFTables && r.enableIPv6 && r.tunOptions.DNSModeOrDefault() == DNSModeHijack {
+		server.packetHandler = r.handler
 	}
 	err := runInNetworkNamespace(r.tunOptions.NetNs, server.Start)
 	if err != nil {
@@ -409,12 +397,9 @@ func (r *autoRedirect) Close() error {
 		err = r.redirectServer.Close()
 		r.redirectServer = nil
 	}
-	if r.redirectDNSServer != nil {
-		err = E.Errors(err, r.redirectDNSServer.Close())
-		r.redirectDNSServer = nil
-	}
 	if r.useNFTables {
 		_ = runInNetworkNamespace(r.tunOptions.NetNs, func() error {
+			r.restoreForwarding()
 			r.cleanupNFTables()
 			r.cleanupRedirectRoutes()
 			return nil
@@ -424,6 +409,7 @@ func (r *autoRedirect) Close() error {
 			r.ownedNetworkMonitor = false
 		}
 	} else {
+		r.restoreForwarding()
 		r.unregisterNetworkCallback()
 		r.cleanupIPTables()
 		r.cleanupRedirectRoutes()
@@ -501,7 +487,7 @@ func (r *autoRedirect) effectiveMarkMask() uint32 {
 }
 
 func (r *autoRedirect) packetMarkMask(mark uint32) uint32 {
-	if r.useNFTables && (mark == r.tunOptions.AutoRedirectInputMark || mark == r.tunOptions.AutoRedirectResetMark) {
+	if (r.useNFTables || runtime.GOOS != "android") && (mark == r.tunOptions.AutoRedirectInputMark || mark == r.tunOptions.AutoRedirectResetMark) {
 		return math.MaxUint32
 	}
 	return r.effectiveMarkMask()
@@ -526,4 +512,91 @@ func (r *autoRedirect) effectiveNFQueue() uint16 {
 
 func (r *autoRedirect) shouldSkipOutputChain() bool {
 	return len(r.tunOptions.IncludeInterface) > 0 && !common.Contains(r.tunOptions.IncludeInterface, "lo") || common.Contains(r.tunOptions.ExcludeInterface, "lo")
+}
+
+type sysctlState struct {
+	path  string
+	value string
+}
+
+func (r *autoRedirect) enableForwarding() {
+	if runtime.GOOS == "android" {
+		return
+	}
+	enable := func(path string, prepare func() []sysctlState) {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			r.logger.Debug(E.Cause(err, "read ", path))
+			return
+		}
+		value := strings.TrimSpace(string(content))
+		if value == "1" {
+			return
+		}
+		var prepared []sysctlState
+		if prepare != nil {
+			prepared = prepare()
+		}
+		err = os.WriteFile(path, []byte("1"), 0o644)
+		if err != nil {
+			r.logger.Warn(E.Cause(err, "enable ", path))
+			restoreSysctl(prepared)
+			return
+		}
+		r.forwardingRestore = append(r.forwardingRestore, sysctlState{path: path, value: value})
+		r.forwardingRestore = append(r.forwardingRestore, prepared...)
+	}
+	if r.enableIPv4 {
+		enable("/proc/sys/net/ipv4/ip_forward", nil)
+	}
+	if r.enableIPv6 {
+		enable("/proc/sys/net/ipv6/conf/all/forwarding", r.overruleAcceptRA)
+	}
+}
+
+// Writing conf/all/forwarding=1 purges RA-learned default routes on every
+// interface whose accept_ra is not 2 (rt6_purge_dflt_routers) and copies
+// forwarding=1 to conf/default and every existing interface
+// (addrconf_fixup_forwarding), after which ipv6_accept_ra() requires
+// accept_ra=2; raise interfaces left at the host default of 1 beforehand so
+// SLAAC default routes survive.
+func (r *autoRedirect) overruleAcceptRA() []sysctlState {
+	entries, err := os.ReadDir("/proc/sys/net/ipv6/conf")
+	if err != nil {
+		r.logger.Debug(E.Cause(err, "read /proc/sys/net/ipv6/conf"))
+		return nil
+	}
+	var restore []sysctlState
+	for _, entry := range entries {
+		if entry.Name() == "all" {
+			continue
+		}
+		path := "/proc/sys/net/ipv6/conf/" + entry.Name() + "/accept_ra"
+		content, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		value := strings.TrimSpace(string(content))
+		if value != "1" {
+			continue
+		}
+		err = os.WriteFile(path, []byte("2"), 0o644)
+		if err != nil {
+			r.logger.Debug(E.Cause(err, "overrule ", path))
+			continue
+		}
+		restore = append(restore, sysctlState{path: path, value: value})
+	}
+	return restore
+}
+
+func (r *autoRedirect) restoreForwarding() {
+	restoreSysctl(r.forwardingRestore)
+	r.forwardingRestore = nil
+}
+
+func restoreSysctl(states []sysctlState) {
+	for _, state := range states {
+		_ = os.WriteFile(state.path, []byte(state.value), 0o644)
+	}
 }

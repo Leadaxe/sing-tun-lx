@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/sagernet/nftables"
+	"github.com/sagernet/nftables/binaryutil"
 	"github.com/sagernet/nftables/expr"
 	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common"
@@ -113,7 +114,7 @@ func (r *autoRedirect) setupNFTables() error {
 		}
 	}
 
-	if r.redirectServer != nil || r.redirectDNSServer != nil || !r.preroutingReject {
+	if r.redirectServer != nil || !r.preroutingReject {
 		inputPriority := nftables.ChainPriorityFilter
 		if !r.preroutingReject {
 			inputPriority = nftables.ChainPriorityMangle
@@ -127,10 +128,9 @@ func (r *autoRedirect) setupNFTables() error {
 		})
 		if r.redirectServer != nil {
 			r.nftablesCreateRedirectPortReject(nft, table, chainInput, unix.IPPROTO_TCP, r.redirectPort())
-		}
-		if r.redirectDNSServer != nil {
-			r.nftablesCreateRedirectPortReject(nft, table, chainInput, unix.IPPROTO_TCP, r.redirectDNSServer.tcpPort())
-			r.nftablesCreateRedirectPortReject(nft, table, chainInput, unix.IPPROTO_UDP, r.redirectDNSServer.udpPort())
+			if r.redirectServer.packetConn != nil {
+				r.nftablesCreateRedirectPortReject(nft, table, chainInput, unix.IPPROTO_UDP, r.redirectServer.PacketPort())
+			}
 		}
 		if !r.preroutingReject {
 			r.nftablesCreateResetReject(nft, table, chainInput)
@@ -222,6 +222,42 @@ func (r *autoRedirect) setupNFTables() error {
 				},
 			},
 		})
+		unreachableFamily := r.nftablesUnreachableFamily()
+		if unreachableFamily != nftables.TableFamilyUnspecified {
+			exprs := []expr.Any{
+				&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{uint8(unreachableFamily)}},
+			}
+			if len(r.tunOptions.ExcludeInterface) > 0 {
+				excludeInterface := &nftables.Set{
+					Table:        table,
+					Anonymous:    true,
+					Constant:     true,
+					KeyType:      nftables.TypeIFName,
+					KeyByteOrder: binaryutil.NativeEndian,
+				}
+				err = nft.AddSet(excludeInterface, common.Map(r.tunOptions.ExcludeInterface, func(it string) nftables.SetElement {
+					return nftables.SetElement{Key: nftablesIfname(it)}
+				}))
+				if err != nil {
+					return E.Cause(err, "add exclude interface set")
+				}
+				exprs = append(exprs,
+					&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+					&expr.Lookup{
+						SourceRegister: 1,
+						SetID:          excludeInterface.ID,
+						SetName:        excludeInterface.Name,
+						Invert:         true,
+					},
+				)
+			}
+			nft.AddRule(&nftables.Rule{
+				Table: table,
+				Chain: chainPreRoutingUDP,
+				Exprs: append(exprs, &expr.Counter{}, &expr.Verdict{Kind: expr.VerdictReturn}),
+			})
+		}
 		nft.AddRule(&nftables.Rule{
 			Table: table,
 			Chain: chainPreRoutingUDP,
@@ -559,21 +595,15 @@ func (r *autoRedirect) nftablesAddPreMatchRules(nft *nftables.Conn, table *nftab
 		Exprs: []expr.Any{
 			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
-			&expr.Payload{
-				OperationType: expr.PayloadLoad,
-				DestRegister:  1,
-				Base:          expr.PayloadBaseTransportHeader,
-				Offset:        13,
-				Len:           1,
-			},
+			&expr.Ct{Key: expr.CtKeySTATE, Register: 1},
 			&expr.Bitwise{
 				SourceRegister: 1,
 				DestRegister:   1,
-				Len:            1,
-				Mask:           []byte{0x12},
-				Xor:            []byte{0x00},
+				Len:            4,
+				Mask:           binaryutil.NativeEndian.PutUint32(expr.CtStateBitNEW | expr.CtStateBitRELATED),
+				Xor:            make([]byte, 4),
 			},
-			&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte{0x02}},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: make([]byte, 4)},
 			&expr.Verdict{Kind: expr.VerdictReturn},
 		},
 	})

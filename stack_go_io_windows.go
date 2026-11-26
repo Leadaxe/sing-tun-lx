@@ -138,6 +138,10 @@ func (o *goWindowsIO) armReadWait() (bool, error) {
 	return false, nil
 }
 
+func (o *goWindowsIO) setDeviceReadEnabled(enabled bool) error {
+	return nil
+}
+
 func (o *goWindowsIO) wait(timeout time.Duration, events []goSocketEvent) (bool, int, error) {
 	tunReadable := !o.ringDrained
 	if o.ringDrained {
@@ -282,8 +286,8 @@ func (o *goWindowsIO) unregisterSocket(socket *goSocket) {
 }
 
 func (o *goWindowsIO) readBurst(frames []goFrame, options N.ReadWaitOptions) (int, bool, error) {
-	o.receiveSlots.configure(goReadBatch, o.stack.mtu+options.FrontHeadroom+options.RearHeadroom)
-	limit := min(len(frames), goReadBatch)
+	o.receiveSlots.configure(o.stack.profile.readBatch, o.stack.mtu+options.FrontHeadroom+options.RearHeadroom)
+	limit := min(len(frames), o.stack.profile.readBatch)
 	o.receiveSlots.wake(limit)
 	count := 0
 	for count < limit {

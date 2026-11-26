@@ -9,7 +9,7 @@ require (
 	github.com/mdlayher/netlink v1.11.2
 	github.com/sagernet/fswatch v0.1.2
 	github.com/sagernet/gvisor v0.0.0-20260727.0-sing-box-mod.1
-	github.com/sagernet/netlink v0.0.0-20260814022025-64455d367bbf
+	github.com/sagernet/netlink v0.0.0-20261125120807-b006b90aa077
 	github.com/sagernet/nftables v0.3.0-mod.4.0.20261114074246-0b310c3e010b
 	github.com/sagernet/sing v0.9.5-0.20260917142815-f37989cadbf0
 	github.com/stretchr/testify v1.11.1

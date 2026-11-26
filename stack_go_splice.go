@@ -858,7 +858,7 @@ func (e *goEngine) packetSpliceRead(w *GoPacketConn) {
 	if count == batchSize {
 		e.packetReceiveBatch = min(batchSize*2, goPacketBatchSize)
 	} else if count*2 < batchSize {
-		e.packetReceiveBatch = max(batchSize/2, goReceiveBatchMin)
+		e.packetReceiveBatch = max(batchSize/2, e.stack.profile.receiveBatchMin)
 	}
 	defer func() {
 		e.flushPacketFrames()
@@ -872,6 +872,7 @@ func (e *goEngine) packetSpliceRead(w *GoPacketConn) {
 			e.packetSpliceClose(w, E.Cause(errno, "go: receive peer batch"))
 		}
 	}()
+	var delivered bool
 	for index := range count {
 		message := e.packetMessages[index]
 		if message.truncated {
@@ -903,12 +904,16 @@ func (e *goEngine) packetSpliceRead(w *GoPacketConn) {
 			if destination.IsIP() && natConn.allowPeer(destination) {
 				goCount(splice.options.WriteCounters, buffer.Len())
 				e.packetSpliceDownload(w, buffer.Bytes(), destination)
+				delivered = true
 			}
 			offset += length
 			if offset == len(message.data) {
 				break
 			}
 		}
+	}
+	if delivered {
+		natConn.service.cache.GetAndRefresh(natConn.key)
 	}
 }
 
@@ -991,7 +996,7 @@ func (e *goEngine) packetSpliceDownload(w *GoPacketConn, data []byte, destinatio
 		return
 	}
 	frame := &e.packetFrames[e.packetFrameCount]
-	meta, err := w.preparePacketHeader(frame.header[:], data, destination, w.checksumOffload)
+	meta, err := w.preparePacketHeader(frame.header[:], data, destination, w.platformIO.transmitChecksumOffload())
 	if err != nil {
 		if err != errGoFrameDropped {
 			e.stack.logger.Trace(err)

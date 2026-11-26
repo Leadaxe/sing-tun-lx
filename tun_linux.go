@@ -253,14 +253,8 @@ func (t *NativeTun) enableGSO() error {
 			t.gro.disableTCPGRO()
 			t.gro.disableUDPGRO()
 		}
-	} else {
-		err = setUDPOffload(t.tunFd)
-		if err != nil {
-			if t.options.Logger != nil {
-				t.options.Logger.Warn(E.Cause(err, "enable offload: set udp offload"))
-			}
-			t.gro.disableUDPGRO()
-		}
+	} else if setUDPOffload(t.tunFd) != nil {
+		t.gro.disableUDPGRO()
 	}
 	t.readRawConn, err = t.tunFile.SyscallConn()
 	if err != nil {
@@ -753,10 +747,10 @@ func (t *NativeTun) rules() []*netlink.Rule {
 	priority6 := priority
 
 	if t.options.AutoRedirectMarkMode {
-		inputMark := effectiveMark(t.options.AutoRedirectInputMark, DefaultAutoRedirectInputMark, DefaultAutoRedirectInputMarkAndroid)
-		outputMark := effectiveMark(t.options.AutoRedirectOutputMark, DefaultAutoRedirectOutputMark, DefaultAutoRedirectOutputMarkAndroid)
-		resetMark := effectiveMark(t.options.AutoRedirectResetMark, DefaultAutoRedirectResetMark, DefaultAutoRedirectResetMarkAndroid)
-		tproxyMark := effectiveMark(t.options.AutoRedirectTProxyMark, DefaultAutoRedirectTProxyMark, DefaultAutoRedirectTProxyMarkAndroid)
+		inputMark := effectiveMark(t.options.AutoRedirectInputMark, DefaultAutoRedirectInputMark)
+		outputMark := effectiveMark(t.options.AutoRedirectOutputMark, DefaultAutoRedirectOutputMark)
+		resetMark := effectiveMark(t.options.AutoRedirectResetMark, DefaultAutoRedirectResetMark)
+		tproxyMark := effectiveMark(t.options.AutoRedirectTProxyMark, DefaultAutoRedirectTProxyMark)
 		markMask := int(inputMark | outputMark | resetMark | tproxyMark)
 		inputMarkMask := markMask
 		if t.options.AutoRedirectInputMarkMask != 0 {
@@ -1227,10 +1221,15 @@ func (t *NativeTun) unsetRules() error {
 		for _, rule := range ruleList {
 			ruleStart := t.options.IPRoute2RuleIndex
 			ruleEnd := ruleStart + 10
-			if rule.Priority >= ruleStart && rule.Priority <= ruleEnd || (t.options.AutoRedirectMarkMode && rule.Priority == t.options.IPRoute2AutoRedirectFallbackRuleIndex) {
+			fallbackRule := t.options.AutoRedirectMarkMode && rule.Priority == t.options.IPRoute2AutoRedirectFallbackRuleIndex &&
+				rule.Invert && rule.Table == t.options.IPRoute2TableIndex
+			if rule.Priority >= ruleStart && rule.Priority <= ruleEnd || fallbackRule {
 				ruleToDel := netlink.NewRule()
 				ruleToDel.Family = rule.Family
 				ruleToDel.Priority = rule.Priority
+				if fallbackRule {
+					ruleToDel.Table = rule.Table
+				}
 				err = netlink.RuleDel(ruleToDel)
 				if err != nil {
 					return E.Cause(err, "unset rule ", rule.Priority, " for ", rule.Family)

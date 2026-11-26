@@ -1,8 +1,6 @@
 package tun
 
 import (
-	"runtime"
-	"slices"
 	"sync"
 
 	"github.com/sagernet/sing-tun/internal/winipcfg"
@@ -11,20 +9,11 @@ import (
 	"github.com/sagernet/sing/common/x/list"
 
 	"golang.org/x/sys/windows"
-	"golang.org/x/sys/windows/registry"
 )
-
-const registryNotifyFilter = windows.REG_NOTIFY_CHANGE_NAME | windows.REG_NOTIFY_CHANGE_LAST_SET
-
-var dnsRegistryPaths = []string{
-	`SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces`,
-	`SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces`,
-}
 
 type networkUpdateMonitor struct {
 	routeListener     *winipcfg.RouteChangeCallback
 	interfaceListener *winipcfg.InterfaceChangeCallback
-	dnsWatcher        *registryWatcher
 
 	access    sync.Mutex
 	callbacks list.List[NetworkUpdateCallback]
@@ -44,6 +33,7 @@ func (m *networkUpdateMonitor) Start() error {
 	if err != nil {
 		return err
 	}
+	m.routeListener = routeListener
 	interfaceListener, err := winipcfg.RegisterInterfaceChangeCallback(func(notificationType winipcfg.MibNotificationType, iface *winipcfg.MibIPInterfaceRow) {
 		m.emit()
 	})
@@ -51,15 +41,7 @@ func (m *networkUpdateMonitor) Start() error {
 		routeListener.Unregister()
 		return err
 	}
-	dnsWatcher, err := newRegistryWatcher(dnsRegistryPaths, m.emit, m.logger)
-	if err != nil {
-		routeListener.Unregister()
-		interfaceListener.Unregister()
-		return err
-	}
-	m.routeListener = routeListener
 	m.interfaceListener = interfaceListener
-	m.dnsWatcher = dnsWatcher
 	return nil
 }
 
@@ -72,110 +54,7 @@ func (m *networkUpdateMonitor) Close() error {
 		m.interfaceListener.Unregister()
 		m.interfaceListener = nil
 	}
-	if m.dnsWatcher != nil {
-		m.dnsWatcher.Close()
-		m.dnsWatcher = nil
-	}
 	return nil
-}
-
-type registryWatcher struct {
-	paths  []string
-	keys   []registry.Key
-	events []windows.Handle
-	done   chan struct{}
-}
-
-func newRegistryWatcher(paths []string, callback func(), logger logger.Logger) (*registryWatcher, error) {
-	closeEvent, err := windows.CreateEvent(nil, 1, 0, nil)
-	if err != nil {
-		return nil, E.Cause(err, "create event")
-	}
-	watcher := &registryWatcher{
-		paths:  paths,
-		events: []windows.Handle{closeEvent},
-		done:   make(chan struct{}),
-	}
-	for _, path := range paths {
-		var key registry.Key
-		key, err = registry.OpenKey(registry.LOCAL_MACHINE, path, registry.NOTIFY)
-		if err != nil {
-			watcher.release()
-			return nil, E.Cause(err, "open registry key ", path)
-		}
-		watcher.keys = append(watcher.keys, key)
-		var event windows.Handle
-		event, err = windows.CreateEvent(nil, 0, 0, nil)
-		if err != nil {
-			watcher.release()
-			return nil, E.Cause(err, "create event")
-		}
-		watcher.events = append(watcher.events, event)
-	}
-	// lx: SPEC 130 — notifications are armed on the loop's locked thread (see notify)
-	armed := make(chan error, 1)
-	go watcher.loop(callback, logger, armed)
-	err = <-armed
-	if err != nil {
-		<-watcher.done
-		watcher.release()
-		return nil, err
-	}
-	return watcher, nil
-}
-
-// lx: SPEC 130 — registryNotifyFilter has no REG_NOTIFY_THREAD_AGNOSTIC (Windows
-// 7 rejects it), and without the flag a notification is cancelled when the
-// registering thread exits, so all registrations happen on the loop goroutine,
-// which stays locked to its OS thread for the watcher's lifetime.
-func (w *registryWatcher) notify(index int) error {
-	return windows.RegNotifyChangeKeyValue(windows.Handle(w.keys[index]), true, registryNotifyFilter, w.events[index+1], true)
-}
-
-func (w *registryWatcher) loop(callback func(), logger logger.Logger, armed chan<- error) {
-	defer close(w.done)
-	// lx: SPEC 130 — never unlocked: the thread exits together with the goroutine
-	runtime.LockOSThread()
-	for index, path := range w.paths {
-		err := w.notify(index)
-		if err != nil {
-			armed <- E.Cause(err, "watch registry key ", path)
-			return
-		}
-	}
-	armed <- nil
-	for {
-		event, err := windows.WaitForMultipleObjects(w.events, false, windows.INFINITE)
-		if err != nil {
-			logger.Error("wait registry change: ", err)
-			return
-		}
-		index := int(event - windows.WAIT_OBJECT_0)
-		if index == 0 {
-			return
-		}
-		err = w.notify(index - 1)
-		if err != nil {
-			logger.Error("watch registry key: ", err)
-			return
-		}
-		callback()
-	}
-}
-
-func (w *registryWatcher) Close() {
-	windows.SetEvent(w.events[0])
-	<-w.done
-	w.release()
-}
-
-func (w *registryWatcher) release() {
-	for _, key := range w.keys {
-		key.Close()
-	}
-	for _, event := range w.events {
-		windows.CloseHandle(event)
-	}
 }
 
 func (m *defaultInterfaceMonitor) checkUpdate() error {
@@ -186,10 +65,7 @@ func (m *defaultInterfaceMonitor) checkUpdate() error {
 
 	lowestMetric := ^uint32(0)
 	alias := ""
-	var (
-		index int
-		luid  winipcfg.LUID
-	)
+	var index int
 
 	for _, row := range rows {
 		if row.DestinationPrefix.PrefixLength != 0 {
@@ -219,7 +95,6 @@ func (m *defaultInterfaceMonitor) checkUpdate() error {
 			lowestMetric = metric
 			alias = ifrow.Alias()
 			index = int(ifrow.InterfaceIndex)
-			luid = row.InterfaceLUID
 		}
 	}
 
@@ -231,14 +106,8 @@ func (m *defaultInterfaceMonitor) checkUpdate() error {
 	if err != nil {
 		return E.Cause(err, "find updated interface: ", alias)
 	}
-	dnsServers, err := luid.DNS()
-	if err != nil {
-		return E.Cause(err, "read DNS servers: ", alias)
-	}
 	oldInterface := m.defaultInterface.Swap(newInterface)
-	oldDNSServers := m.defaultDNSServers
-	m.defaultDNSServers = dnsServers
-	if !defaultInterfaceChanged(oldInterface, newInterface) && slices.Equal(oldDNSServers, dnsServers) {
+	if !defaultInterfaceChanged(oldInterface, newInterface) {
 		return nil
 	}
 	m.emit(newInterface, 0)
